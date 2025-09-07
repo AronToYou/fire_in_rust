@@ -87,6 +87,46 @@ impl Sim {
         }
     }
 
+    fn step(&mut self) {
+        // (1) Update level set field
+        self.update_levelset();
+    }
+
+    /// Thin flame boundary propagation
+    fn update_levelset(&mut self) {
+        let (nx, ny, k_react) = (self.p.nx, self.p.ny, self.p.k_react);
+        let mut idx = nx;
+        for _ in 1..ny-1 {
+            idx += 1;
+            for _ in 1..nx-1 {
+                let gx = self.phi[idx+1] - self.phi[idx-1];
+                let gy = self.phi[idx+nx] - self.phi[idx-nx];
+                let norm = ((gx*gx + gy*gy).sqrt()).max(1e-6);
+                
+                let wx = self.uf[idx] + k_react*gx/norm;
+                let wy = self.vf[idx] + k_react*gy/norm;
+
+                // Upwind differencing
+                let ddx = if wx > 0.0 {
+                    self.phi[idx] - self.phi[idx-1]
+                } else {
+                    self.phi[idx+1] - self.phi[idx]
+                };
+
+                let ddy = if wy > 0.0 {
+                    self.phi[idx] - self.phi[idx-nx]
+                } else {
+                    self.phi[idx+nx] - self.phi[idx]
+                };
+                self.tmp[idx] = self.phi[idx] - (wx*ddx + wy*ddy)*(self.p.dt/self.p.h);
+
+                idx += 1;
+            }
+            idx += 1;
+        }
+        std::mem::swap(&mut self.phi, &mut self.tmp);
+    }
+
     fn print_field(&self, which: Field) {
         let (label, field): (&str, &[f32]) = match which {
             Field::Ph => ("Hot Gas Pressure", &self.p_h),
@@ -110,7 +150,7 @@ impl Sim {
 
 // ---------------- Main ----------------
 fn main() {
-    let sim = Sim::new(Params {
+    let mut sim = Sim::new(Params {
         nx: 240, ny: 320,
         h: 1.0,
         dt: 0.5,
@@ -136,7 +176,8 @@ fn main() {
     let ten_ms = Duration::from_millis(10);
     println!("Simulating {steps} steps...");
     for _ in (0..steps).progress() {
-        sleep(ten_ms);
+        sim.step();
     }
+    sim.print_field(Field::Phi);
     println!("Done!");
 }

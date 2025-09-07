@@ -43,6 +43,12 @@ struct Sim {
     tmp: Vec<f32>  // temporary intermediate field for calculations
 }
 
+/// Which field from `Sim` to print
+enum Field { 
+    Ph, Divh,
+    Phi, Temp, Rt, Dns
+}
+
 impl Sim {
     fn new(p: Params) -> Self {
         let n = p.nx*p.ny;
@@ -64,6 +70,7 @@ impl Sim {
         s
     }
 
+    /// Initialize fuel inlet at bottom of domain
     fn init_fuel_inlet(&mut self) {
         let (nx, ny) = (self.p.nx, self.p.ny);
         let mut idx: usize = 0;
@@ -77,6 +84,26 @@ impl Sim {
                 }
                 idx += 1;
             }
+        }
+    }
+
+    fn print_field(&self, which: Field) {
+        let (label, field): (&str, &[f32]) = match which {
+            Field::Ph => ("Hot Gas Pressure", &self.p_h),
+            Field::Divh => ("Divergence of Hot Gas Pressure", &self.div_h),
+            Field::Phi => ("Level Set", &self.phi),
+            Field::Temp => ("Temperature", &self.temp),
+            Field::Rt => ("Reaction Parameter", &self.rt),
+            Field::Dns => ("Smoke Density", &self.dns)
+        };
+        let (nx, ny) = (self.p.nx, self.p.ny);
+        let (stride_x, stride_y) = (nx/30, ny/30);
+        println!("{label} field ({nx}x{ny}), sampled with stride: ({stride_x}, {stride_y})");
+        for y in (0..ny).rev().step_by(stride_y) {
+            for x in (0..nx).step_by(stride_x) {
+                print!("{:4.1} ", field[x + y*nx]);
+            }
+            println!();
         }
     }
 }
@@ -102,6 +129,8 @@ fn main() {
         render_scale: 1.0
     });
 
+    // Prints the initialized level set field
+    sim.print_field(Field::Phi);
     
     let steps = 300;
     let ten_ms = Duration::from_millis(10);

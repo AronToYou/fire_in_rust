@@ -1,6 +1,8 @@
 use indicatif::ProgressIterator;
 use std::time::Duration;
-use std::thread::sleep;
+
+// ---------------- Utility Functions ----------------
+#[inline] fn clamp(v: f32, lb: f32, ub: f32) -> f32 { v.max(lb).min(ub) }
 
 // ---------------- Simulation Parameters ----------------
 #[derive(Clone, Copy)]
@@ -40,7 +42,7 @@ struct Sim {
     rt: Vec<f32>,    // reaction-time tracker (1 at fuel; decreases after crossing)
     dns: Vec<f32>,   // smoke density (simple)
 
-    tmp: Vec<f32>  // temporary intermediate field for calculations
+    tmp: Vec<f32>, tmp2: Vec<f32>  // temporary intermediate fields for calculations
 }
 
 /// Which field from `Sim` to print
@@ -64,7 +66,7 @@ impl Sim {
             rt: vec![0.0; n],
             dns: vec![0.0; n],
 
-            tmp: vec![0.0; n]
+            tmp: vec![0.0; n], tmp2: vec![0.0; n]
         };
         s.init_fuel_inlet();
         s
@@ -88,36 +90,43 @@ impl Sim {
     }
 
     fn step(&mut self) {
-        // (1) Update level set field
+        // (1) Update level set field //
         self.update_levelset();
+
+        // (2) Semi-Lagrangian advection of velocity fields //
+        self.semi_lagrangian_advect(&self.uf, &self.vf);
     }
 
-    /// Thin flame boundary propagation
+    // ----------------- (1) Thin-flame Level Set Propagation -----------------
+    /// Updates the level set using upwind one-sided differencing to estimate spatial derivatives
     fn update_levelset(&mut self) {
         let (nx, ny, k_react) = (self.p.nx, self.p.ny, self.p.k_react);
         let mut idx = nx;
         for _ in 1..ny-1 {
             idx += 1;
             for _ in 1..nx-1 {
-                let gx = self.phi[idx+1] - self.phi[idx-1];
-                let gy = self.phi[idx+nx] - self.phi[idx-nx];
-                let norm = ((gx*gx + gy*gy).sqrt()).max(1e-6);
+                // (1.3) (unscaled) Central differencing for normed gradient (∇φ/|∇φ|) //
+                let gx = self.phi[idx+1] - self.phi[idx-1];  // gradient x-component
+                let gy = self.phi[idx+nx] - self.phi[idx-nx];  // gradient y-component
+                let norm = (gx*gx + gy*gy).sqrt().max(1e-8);  // gradient norm
                 
+                // (1.2) Velocity of implicit surface (where φ==0) //
                 let wx = self.uf[idx] + k_react*gx/norm;
                 let wy = self.vf[idx] + k_react*gy/norm;
 
-                // Upwind differencing
+                // (unscaled) Upwind one-sided differencing //
                 let ddx = if wx > 0.0 {
                     self.phi[idx] - self.phi[idx-1]
                 } else {
                     self.phi[idx+1] - self.phi[idx]
                 };
-
                 let ddy = if wy > 0.0 {
                     self.phi[idx] - self.phi[idx-nx]
                 } else {
                     self.phi[idx+nx] - self.phi[idx]
                 };
+
+                // (1.4) (scaled) Application of time derivative //
                 self.tmp[idx] = self.phi[idx] - (wx*ddx + wy*ddy)*(self.p.dt/self.p.h);
 
                 idx += 1;
@@ -127,6 +136,48 @@ impl Sim {
         std::mem::swap(&mut self.phi, &mut self.tmp);
     }
 
+    // ------------- (2) Semi-Lagrangian advection for velocities -------------
+    /// Backtrace with RK2, bilinear sample, no boundary conditions
+    fn semi_lagrangian_advect(&mut self, u: &mut Vec<f32>, v: &mut Vec<f32>) {
+        let (nx, ny, dt, h) = (self.p.nx, self.p.ny, self.p.dt, self.p.h);
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = x + y*nx;
+
+                // RK2 backtrace
+                let px = x as f32 - u[i]*dt/h;
+                let py = y as f32 - v[i]*dt/h;
+                // midpoint velocity
+                let um = self.sample_bilin(u, px, py);
+                let vm = self.sample_bilin(v, px, py);
+
+                let bx = x as f32 - um*0.5*dt/h;
+                let by = y as f32 - vm*0.5*dt/h;
+                self.tmp[i] = self.sample_bilin(u, bx, by);
+                self.tmp2[i] = self.sample_bilin(v, bx, by);
+            }
+        }
+        std::mem::swap(u, &mut self.tmp);
+        std::mem::swap(v, &mut self.tmp2);
+    }
+
+    // ----------------- Utility Functions -----------------
+    /// Bilinear sampling of scalar field, clamped at boundaries
+    fn sample_bilin(&mut self, f: &Vec<f32>, x: f32, y: f32) -> f32 {
+        let (nx, ny) = (self.p.nx, self.p.ny);
+        let x = clamp(x, 0.0, (nx as f32) - 1.001);
+        let y = clamp(y, 0.0, (ny as f32) - 1.001);  
+        let x0 = x.floor() as usize; let y0 = y.floor() as usize;
+        let x1 = (x0+1).min(nx-1);   let y1 = (y0+1).min(ny-1);
+        let tx = x - x0 as f32;      let ty = y - y0 as f32;
+        
+        let f00 = f[x0 + y0*nx];       let f01 = f[x0 + y1*nx];
+        let f10 = f[x1 + y0*nx];       let f11 = f[x1 + y1*nx];
+        let a = f00*(1.0-tx) + f10*tx; let b = f01*(1.0-tx) + f11*tx;
+        a*(1.0-ty) + b*ty
+    }
+
+    /// Print a downsampled version of a field to the console
     fn print_field(&self, which: Field) {
         let (label, field): (&str, &[f32]) = match which {
             Field::Ph => ("Hot Gas Pressure", &self.p_h),

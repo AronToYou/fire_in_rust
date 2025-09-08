@@ -3,9 +3,15 @@ Incompressible Navier-Stokes
 $$\pdv{\mathbf{u}}{t} = -(\mathbf{u}\cdot\nabla)\mathbf{u} - \frac{1}{\rho}\nabla p + \nu\nabla^2\mathbf{u} + \mathbf{f}$$
 ## Stable Fluids
 ## 1. **Thin flame** tracked by **level set** $\phi$
-- moves with $w = u_{fuel} + S\cdot n$ (upwind update)
-	- $\phi_t = -(\mathbf{u}_f + S\cdot\mathbf{n})\cdot\nabla\phi$
-- giving blue reaction zone? ($\phi>0$)
+1. Implicit surface where ($\phi=0$) defines the interface between
+	- **Fuel** ($\phi>0$) blue-core reaction zone
+	- **Hot Gas** ($\phi<0$)
+2. velocity of surface
+$$w = u_{fuel} + S\cdot n$$
+3. Implicit surface unit normal vector (central differencing)
+$$\mathbf{n} = \nabla\phi/|\nabla\phi|$$
+4. Time derivative of level set (upwind differencing for $\nabla\phi$)
+$$\phi_t = -(\mathbf{u}_f + S\mathbf{n})\cdot\nabla\phi$$
 - evolve **fuel** and **hot gas** velocity fields separately
 ### 2. **Add Force** (before advection)
 #### Buoyancy
@@ -61,8 +67,8 @@ $T_t = -(\mathbf{u}\cdot\nabla)T - c_T\Big(\frac{T - T_{air}}{T_{max} - T_{air}}
 	- (applied during semi-Lagrangian sampling of hot-gas field)
 	- pressure jump conditions not enforced in the linear system
 
-- [ ] edition 2021
 - [ ] generalize to 3D
+- [ ] generic Field type
 
 
 # Miscellaneous Notes
@@ -75,4 +81,3 @@ For a generic scalar field $S$ that flows with velocity $\mathbf{u}$
 $$\pdv{S}{t} = -(\mathbf{u}\cdot\nabla)S + k_S\nabla^2S - a_SS + source$$
 - $k_S$  :  diffusion constant
 - $a_S$  :  dissipation rate
-

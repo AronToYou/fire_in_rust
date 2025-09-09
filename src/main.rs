@@ -1,8 +1,39 @@
 use indicatif::ProgressIterator;
-use std::time::Duration;
+use std::ops::{Add, Sub, Mul};
 
 // ---------------- Utility Functions ----------------
 #[inline] fn clamp(v: f32, lb: f32, ub: f32) -> f32 { v.max(lb).min(ub) }
+
+fn new_sim(p: Params) -> Sim<impl Fn((f32, f32)) -> (f32, f32)> {
+    let maxx = p.nx as f32 - 1.001;
+    let maxy = p.ny as f32 - 1.001;
+    let clamp = move |(x, y): (f32, f32)| (x.clamp(0.0, maxx), y.clamp(0.0, maxy));
+    Sim::new(p, clamp)
+}
+
+#[derive(Clone, Copy)]
+struct P(f32, f32);
+
+impl Add for P {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        P(self.0 + rhs.0, self.1 + rhs.1)
+    }
+}
+
+impl Sub for P {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        P(self.0 - rhs.0, self.1 - rhs.1)
+    }
+}
+
+impl Mul<f32> for P {
+    type Output = Self;
+    fn mul(self, rhs: f32) -> Self {
+        P(self.0 * rhs, self.1 * rhs)
+    }
+}
 
 // ---------------- Simulation Parameters ----------------
 #[derive(Clone, Copy)]
@@ -29,11 +60,11 @@ struct Params {
 }
 
 // ---------------- Simulation State ----------------
-struct Sim {
+struct Sim<C> where C: Fn((f32, f32)) -> (f32, f32) {
     p: Params,  // Simulation parameters (defined above)
-    
-    uf: Vec<f32>, vf: Vec<f32>,  // velocity field fuel    (x, y)
-    uh: Vec<f32>, vh: Vec<f32>,  // velocity field hot gas (x, y)
+    clamp: C,
+
+    ux: Vec<f32>, uy: Vec<f32>,  // velocity field (x, y)
     p_h: Vec<f32>,    // pressure for hot gas
     div_h: Vec<f32>,  // divergence (hot gas)
 
@@ -47,17 +78,17 @@ struct Sim {
 
 /// Which field from `Sim` to print
 enum Field { 
+    Ux, Uy,
     Ph, Divh,
     Phi, Temp, Rt, Dns
 }
 
-impl Sim {
-    fn new(p: Params) -> Self {
+impl<C> Sim<C> where C: Fn((f32, f32)) -> (f32, f32) {
+    fn new(p: Params, clamp: C) -> Self {
         let n = p.nx*p.ny;
         let mut s = Self {
-            p,
-            uf: vec![0.0; n], vf: vec![0.0; n],
-            uh: vec![0.0; n], vh: vec![0.0; n],
+            p, clamp,
+            ux: vec![0.0; n], uy: vec![0.0; n],
             p_h: vec![0.0; n],
             div_h: vec![0.0; n],
 
@@ -79,7 +110,7 @@ impl Sim {
         for y in 0..ny {
             for _ in 0..nx {
                 if y < 10 {
-                    self.vf[idx] = 1.5;
+                    self.uy[idx] = 1.5;
                     self.phi[idx] = 5.0;
                 } else {
                     self.phi[idx] = -5.0;
@@ -94,7 +125,7 @@ impl Sim {
         self.update_levelset();
 
         // (2) Semi-Lagrangian advection of velocity fields //
-        self.semi_lagrangian_advect(&self.uf, &self.vf);
+        self.semi_lagrangian_advect();
     }
 
     // ----------------- (1) Thin-flame Level Set Propagation -----------------
@@ -111,8 +142,8 @@ impl Sim {
                 let norm = (gx*gx + gy*gy).sqrt().max(1e-8);  // gradient norm
                 
                 // (1.2) Velocity of implicit surface (where φ==0) //
-                let wx = self.uf[idx] + k_react*gx/norm;
-                let wy = self.vf[idx] + k_react*gy/norm;
+                let wx = self.ux[idx] + k_react*gx/norm;
+                let wy = self.uy[idx] + k_react*gy/norm;
 
                 // (unscaled) Upwind one-sided differencing //
                 let ddx = if wx > 0.0 {
@@ -136,34 +167,36 @@ impl Sim {
         std::mem::swap(&mut self.phi, &mut self.tmp);
     }
 
-    // ------------- (2) Semi-Lagrangian advection for velocities -------------
-    /// Backtrace with RK2, bilinear sample, no boundary conditions
-    fn semi_lagrangian_advect(&mut self, u: &mut Vec<f32>, v: &mut Vec<f32>) {
+    // ------------- (2) Semi-Lagrangian advection of velocity fields -------------
+    /// Runge-Kutta 2-stage backtrace, bilinear velocity sampling, clamped at boundaries
+    fn semi_lagrangian_advect(&mut self) {
+        let (ux, uy) = (&self.ux, &self.uy);
         let (nx, ny, dt, h) = (self.p.nx, self.p.ny, self.p.dt, self.p.h);
         for y in 0..ny {
             for x in 0..nx {
-                let i = x + y*nx;
+                let idx = x + y*nx;
+                let P(x1, y1) = P(x as f32, y as f32);
 
-                // RK2 backtrace
-                let px = x as f32 - u[i]*dt/h;
-                let py = y as f32 - v[i]*dt/h;
-                // midpoint velocity
-                let um = self.sample_bilin(u, px, py);
-                let vm = self.sample_bilin(v, px, py);
+                // backtrace half-step to midpoint //
+                let P(x0, y0) = P(x1, y1) - P(ux[idx], uy[idx])*(0.5*dt/h);
+                // midpoint velocity //
+                let ux0 = self.sample_bilin(ux, x0, y0);
+                let uy0 = self.sample_bilin(uy, x0, y0);
 
-                let bx = x as f32 - um*0.5*dt/h;
-                let by = y as f32 - vm*0.5*dt/h;
-                self.tmp[i] = self.sample_bilin(u, bx, by);
-                self.tmp2[i] = self.sample_bilin(v, bx, by);
+                // backtrace full step //
+                let P(x0, y0) = P(x1, y1) - P(ux0, uy0)*(dt/h);
+                // final velocity //
+                self.tmp[idx] = self.sample_bilin(ux, x0, y0);
+                self.tmp2[idx] = self.sample_bilin(uy, x0, y0);
             }
         }
-        std::mem::swap(u, &mut self.tmp);
-        std::mem::swap(v, &mut self.tmp2);
+        std::mem::swap(&mut self.ux, &mut self.tmp);
+        std::mem::swap(&mut self.uy, &mut self.tmp2);
     }
 
     // ----------------- Utility Functions -----------------
     /// Bilinear sampling of scalar field, clamped at boundaries
-    fn sample_bilin(&mut self, f: &Vec<f32>, x: f32, y: f32) -> f32 {
+    fn sample_bilin(&self, f: &Vec<f32>, x: f32, y: f32) -> f32 {
         let (nx, ny) = (self.p.nx, self.p.ny);
         let x = clamp(x, 0.0, (nx as f32) - 1.001);
         let y = clamp(y, 0.0, (ny as f32) - 1.001);  
@@ -180,6 +213,8 @@ impl Sim {
     /// Print a downsampled version of a field to the console
     fn print_field(&self, which: Field) {
         let (label, field): (&str, &[f32]) = match which {
+            Field::Ux => ("Velocity x Component", &self.ux),
+            Field::Uy => ("Velocity y Component", &self.uy),
             Field::Ph => ("Hot Gas Pressure", &self.p_h),
             Field::Divh => ("Divergence of Hot Gas Pressure", &self.div_h),
             Field::Phi => ("Level Set", &self.phi),
@@ -201,7 +236,7 @@ impl Sim {
 
 // ---------------- Main ----------------
 fn main() {
-    let mut sim = Sim::new(Params {
+    let mut sim = new_sim(Params {
         nx: 240, ny: 320,
         h: 1.0,
         dt: 0.5,
@@ -224,7 +259,6 @@ fn main() {
     sim.print_field(Field::Phi);
     
     let steps = 300;
-    let ten_ms = Duration::from_millis(10);
     println!("Simulating {steps} steps...");
     for _ in (0..steps).progress() {
         sim.step();

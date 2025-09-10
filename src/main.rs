@@ -2,8 +2,7 @@ use indicatif::ProgressIterator;
 use std::ops::{Add, Sub, Mul};
 
 // ---------------- Utility Functions ----------------
-#[inline] fn clamp(v: f32, lb: f32, ub: f32) -> f32 { v.max(lb).min(ub) }
-
+/// Given a Parameter set, creates the corresponding closure and instantiates a Simulation with both
 fn new_sim(p: Params) -> Sim<impl Fn((f32, f32)) -> (f32, f32)> {
     let maxx = p.nx as f32 - 1.001;
     let maxy = p.ny as f32 - 1.001;
@@ -13,6 +12,12 @@ fn new_sim(p: Params) -> Sim<impl Fn((f32, f32)) -> (f32, f32)> {
 
 #[derive(Clone, Copy)]
 struct P(f32, f32);
+
+impl P {
+    fn min(&self, p: P) -> P {
+        P(self.0.min(p.0), self.1.min(p.1))
+    }
+}
 
 impl Add for P {
     type Output = Self;
@@ -199,7 +204,7 @@ impl<C> Sim<C> where C: Fn((f32, f32)) -> (f32, f32) {
     fn sample_bilin(&self, f: &Vec<f32>, x: f32, y: f32) -> f32 {
         let (nx, ny) = (self.p.nx, self.p.ny);
         let x = clamp(x, 0.0, (nx as f32) - 1.001);
-        let y = clamp(y, 0.0, (ny as f32) - 1.001);  
+        let y = clamp(y, 0.0, (ny as f32) - 1.001);
         let x0 = x.floor() as usize; let y0 = y.floor() as usize;
         let x1 = (x0+1).min(nx-1);   let y1 = (y0+1).min(ny-1);
         let tx = x - x0 as f32;      let ty = y - y0 as f32;

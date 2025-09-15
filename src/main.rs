@@ -1,5 +1,6 @@
 use indicatif::ProgressIterator;
 use std::ops::{Add, Sub, Mul};
+use std::fmt;
 
 // ---------------- Utility Functions ----------------
 fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((f32, f32)) -> (f32, f32)> {
@@ -9,27 +10,61 @@ fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((
     Sim::<NX, NY, _>::new(p, clamp_xy)
 }
 
-#[derive(Clone, Copy)]
-struct P(f32, f32);
+trait GridDisp {
+    fn dims(&self) -> (usize, usize);
+    fn at(&self, x: usize, y: usize) -> &dyn fmt::Display;
+}
 
-impl Add for P {
+impl<T, const NX: usize, const NY: usize> GridDisp for [[T; NY]; NX] where T: fmt::Display {
+    fn dims(&self) -> (usize, usize) { (NX, NY) }
+    fn at(&self, x: usize, y: usize) -> &dyn fmt::Display {
+        &self[x][y] as &dyn fmt::Display
+    }
+}
+
+trait Linterp: Add<Output = Self> + Mul<f32, Output = Self> + Copy {}
+impl<T> Linterp for T where T: Add<Output = Self> + Mul<f32, Output = Self> + Copy {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct P<T>(T, T);
+
+impl<T> Add for P<T> where T: Add<Output = T> + Copy {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         P(self.0 + rhs.0, self.1 + rhs.1)
     }
 }
 
-impl Sub for P {
+impl<T> Sub for P<T> where T: Sub<Output = T> + Copy {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         P(self.0 - rhs.0, self.1 - rhs.1)
     }
 }
 
-impl Mul<f32> for P {
+impl<T> Mul<T> for P<T> where T: Mul<Output = T> + Copy {
     type Output = Self;
-    fn mul(self, rhs: f32) -> Self {
+    fn mul(self, rhs: T) -> Self {
         P(self.0 * rhs, self.1 * rhs)
+    }
+}
+
+impl From<P<usize>> for P<f32> {
+    fn from(p: P<usize>) -> Self {
+        P(p.0 as f32, p.1 as f32)
+    }
+}
+
+impl P<f32> {
+    fn floor(&self) -> P<usize> {
+        P(self.0.floor() as usize, self.1.floor() as usize)
+    }
+}
+
+impl fmt::Display for P<f32> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({:1.0},{:1.0})", self.0, self.1)
     }
 }
 
@@ -61,16 +96,16 @@ struct Sim<const NX: usize, const NY: usize, C> where C: Fn((f32, f32)) -> (f32,
     p: Params,  // Simulation parameters (defined above)
     clamp_xy: C,  // clamping function for coordinates
 
-    ux: [[f32; NY]; NX], uy: [[f32; NY]; NX],  // velocity field (x, y)
-    p_h: [[f32; NY]; NX],    // pressure for hot gas
-    div_h: [[f32; NY]; NX],  // divergence (hot gas)
+    u: Box<[[P<f32>; NY]; NX]>,        // velocity field (x, y)
+    p_h: Box<[[f32; NY]; NX]>,    // pressure for hot gas
+    div_h: Box<[[f32; NY]; NX]>,  // divergence (hot gas)
 
-    phi: [[f32; NY]; NX],   // level set (+pos in fuel region, -neg outside, 0 at boundary)
-    temp: [[f32; NY]; NX],  // temperature field (hot gas domain)
-    rt: [[f32; NY]; NX],    // reaction-time tracker (1 at fuel; decreases after crossing)
-    dns: [[f32; NY]; NX],   // smoke density (simple)
+    phi: Box<[[f32; NY]; NX]>,   // level set (+pos in fuel region, -neg outside, 0 at boundary)
+    temp: Box<[[f32; NY]; NX]>,  // temperature field (hot gas domain)
+    rt: Box<[[f32; NY]; NX]>,    // reaction-time tracker (1 at fuel; decreases after crossing)
+    dns: Box<[[f32; NY]; NX]>,   // smoke density (simple)
 
-    tmp: [[f32; NY]; NX], tmp2: [[f32; NY]; NX]  // temporary intermediate fields for calculations
+    tmp: Box<[[f32; NY]; NX]>, tmp2: Box<[[P<f32>; NY]; NX]>  // temporary intermediate fields for calculations
 }
 
 /// Which field from `Sim` to print
@@ -84,16 +119,16 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
     fn new(p: Params, clamp_xy: C) -> Self {
         let mut s = Self {
             p, clamp_xy,
-            ux: [[0.0; NY]; NX], uy: [[0.0; NY]; NX],
-            p_h: [[0.0; NY]; NX],
-            div_h: [[0.0; NY]; NX],
+            u: Box::new([[P(0.0, 0.0); NY]; NX]),
+            p_h: Box::new([[0.0; NY]; NX]),
+            div_h: Box::new([[0.0; NY]; NX]),
 
-            phi: [[1.0; NY]; NX],
-            temp: [[p.temp_air; NY]; NX],
-            rt: [[0.0; NY]; NX],
-            dns: [[0.0; NY]; NX],
+            phi: Box::new([[1.0; NY]; NX]),
+            temp: Box::new([[p.temp_air; NY]; NX]),
+            rt: Box::new([[0.0; NY]; NX]),
+            dns: Box::new([[0.0; NY]; NX]),
 
-            tmp: [[0.0; NY]; NX], tmp2: [[0.0; NY]; NX]
+            tmp: Box::new([[0.0; NY]; NX]), tmp2: Box::new([[P(0.0, 0.0); NY]; NX])
         };
         s.init_fuel_inlet();
         s
@@ -104,7 +139,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         for x in 0..NX {
             for y in 0..NY {
                 if y < 10 {
-                    self.uy[x][y] = 1.5;
+                    self.u[x][y] = P(0.0, 1.5);
                     self.phi[x][y] = 5.0;
                 } else {
                     self.phi[x][y] = -5.0;
@@ -133,9 +168,8 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
                 let norm = (gx*gx + gy*gy).sqrt().max(1e-8);  // gradient norm
                 
                 // (1.2) Velocity of implicit surface (where φ==0) //
-                let wx = self.ux[x][y] + k_react*gx/norm;
-                let wy = self.uy[x][y] + k_react*gy/norm;
-
+                let P(wx, wy) = self.u[x][y] + P(gx, gy)*(k_react/norm);
+                
                 // (unscaled) Upwind one-sided differencing //
                 let ddx = if wx > 0.0 {
                     self.phi[x][y] - self.phi[x-1][y]
@@ -158,59 +192,57 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
     // ------------- (2) Semi-Lagrangian advection of velocity fields -------------
     /// Runge-Kutta 2-stage backtrace, bilinear velocity sampling, clamped at boundaries
     fn semi_lagrangian_advect(&mut self) {
-        let (ux, uy) = (&self.ux, &self.uy);
+        let u = &self.u;
         let (dt, h) = (self.p.dt, self.p.h);
         for x in 0..NX {
             for y in 0..NY {
                 let P(x1, y1) = P(x as f32, y as f32);
 
                 // backtrace half-step to midpoint //
-                let P(x0, y0) = P(x1, y1) - P(ux[x][y], uy[x][y])*(0.5*dt/h);
+                let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
+
                 // midpoint velocity //
-                let ux0 = self.sample_bilin(ux, x0, y0);
-                let uy0 = self.sample_bilin(uy, x0, y0);
+                let u0 = self.sample_bilin(u, (x0, y0));
 
                 // backtrace full step //
-                let P(x0, y0) = P(x1, y1) - P(ux0, uy0)*(dt/h);
+                let P(x0, y0) = P(x1, y1) - u0*(dt/h);
+                
                 // final velocity //
-                self.tmp[x][y] = self.sample_bilin(ux, x0, y0);
-                self.tmp2[x][y] = self.sample_bilin(uy, x0, y0);
+                self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));
             }
         }
-        std::mem::swap(&mut self.ux, &mut self.tmp);
-        std::mem::swap(&mut self.uy, &mut self.tmp2);
+        std::mem::swap(&mut self.u, &mut self.tmp2);
     }
 
     // ----------------- Utility Functions -----------------
     /// Bilinear sampling of scalar field, clamped at boundaries
-    fn sample_bilin(&self, f: &[[f32; NY]; NX], x: &f32, y: &f32) -> f32 {
-        let (x, y) = (self.clamp_xy)((x, y));
-        let x0 = x.floor() as usize; let y0 = y.floor() as usize;
-        let x1 = (x0+1).min(NX-1);   let y1 = (y0+1).min(NY-1);
-        let tx = x - x0 as f32;      let ty = y - y0 as f32;
-        
-        let f00 = f[x0][y0];       let f01 = f[x0][y1];
-        let f10 = f[x1][y0];       let f11 = f[x1][y1];  // store x1 in x0
+    fn sample_bilin<T: Linterp>(&self, f: &[[T; NY]; NX], p: (f32, f32)) -> T {
+        let (x, y) = (self.clamp_xy)(p);
+        let P(x0, y0) = P(x, y).floor();
+        let P(tx, ty) = P(x, y) - P(x0 as f32, y0 as f32);
+
+        let f00 = f[x0][y0];       let f01 = f[x0][y0+1];
+        let f10 = f[x0+1][y0];       let f11 = f[x0+1][y0+1];  // store x1 in x0
         let a = f00*(1.0-tx) + f10*tx; let b = f01*(1.0-tx) + f11*tx;  // store tx in x1/y1 in x0/
         a*(1.0-ty) + b*ty  // store ty in tx in x1/y1 in x0/
     }
 
     /// Print a downsampled version of a field to the console
     fn print_field(&self, which: Field) {
-        let (label, field): (&str, &[[f32; NY]; NX]) = match which {
-            Field::U => ("Velocity (ux, uy)", &self.ux),
-            Field::Ph => ("Hot Gas Pressure", &self.p_h),
-            Field::Divh => ("Divergence of Hot Gas Pressure", &self.div_h),
-            Field::Phi => ("Level Set", &self.phi),
-            Field::Temp => ("Temperature", &self.temp),
-            Field::Rt => ("Reaction Parameter", &self.rt),
-            Field::Dns => ("Smoke Density", &self.dns)
+        let (label, field): (&str, &dyn GridDisp) = match which {
+            Field::U => ("Velocity (ux, uy)", &*self.u),
+            Field::Ph => ("Hot Gas Pressure", &*self.p_h),
+            Field::Divh => ("Divergence of Hot Gas Pressure", &*self.div_h),
+            Field::Phi => ("Level Set", &*self.phi),
+            Field::Temp => ("Temperature", &*self.temp),
+            Field::Rt => ("Reaction Parameter", &*self.rt),
+            Field::Dns => ("Smoke Density", &*self.dns)
         };
-        let (stride_x, stride_y) = (NX/30, NY/30);
+        let (stride_x, stride_y) = ((NX/30).max(1), (NY/30).max(1));
         println!("{label} field ({NX}x{NY}), sampled with stride: ({stride_x}, {stride_y})");
         for y in (0..NY).rev().step_by(stride_y) {
             for x in (0..NX).step_by(stride_x) {
-                print!("{:4.1} ", field[x][y]);
+                print!("{:4.1} ", field.at(x, y));
             }
             println!();
         }
@@ -239,6 +271,7 @@ fn main() {
 
     // Prints the initialized level set field
     sim.print_field(Field::Phi);
+    sim.print_field(Field::U);
     
     let steps = 300;
     println!("Simulating {steps} steps...");
@@ -246,5 +279,6 @@ fn main() {
         sim.step();
     }
     sim.print_field(Field::Phi);
+    sim.print_field(Field::U);
     println!("Done!");
 }

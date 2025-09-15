@@ -1,6 +1,7 @@
+use crate::grid::{P, GridDisp, Linterp};
 use indicatif::ProgressIterator;
-use std::ops::{Add, Sub, Mul};
-use std::fmt;
+
+mod grid;
 
 // ---------------- Utility Functions ----------------
 fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((f32, f32)) -> (f32, f32)> {
@@ -8,64 +9,6 @@ fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((
     let maxy = (NY as f32) - 1.001;
     let clamp_xy = move |(x, y): (f32, f32)| (x.clamp(0.0, maxx), y.clamp(0.0, maxy));
     Sim::<NX, NY, _>::new(p, clamp_xy)
-}
-
-trait GridDisp {
-    fn dims(&self) -> (usize, usize);
-    fn at(&self, x: usize, y: usize) -> &dyn fmt::Display;
-}
-
-impl<T, const NX: usize, const NY: usize> GridDisp for [[T; NY]; NX] where T: fmt::Display {
-    fn dims(&self) -> (usize, usize) { (NX, NY) }
-    fn at(&self, x: usize, y: usize) -> &dyn fmt::Display {
-        &self[x][y] as &dyn fmt::Display
-    }
-}
-
-trait Linterp: Add<Output = Self> + Mul<f32, Output = Self> + Copy {}
-impl<T> Linterp for T where T: Add<Output = Self> + Mul<f32, Output = Self> + Copy {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct P<T>(T, T);
-
-impl<T> Add for P<T> where T: Add<Output = T> + Copy {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        P(self.0 + rhs.0, self.1 + rhs.1)
-    }
-}
-
-impl<T> Sub for P<T> where T: Sub<Output = T> + Copy {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        P(self.0 - rhs.0, self.1 - rhs.1)
-    }
-}
-
-impl<T> Mul<T> for P<T> where T: Mul<Output = T> + Copy {
-    type Output = Self;
-    fn mul(self, rhs: T) -> Self {
-        P(self.0 * rhs, self.1 * rhs)
-    }
-}
-
-impl From<P<usize>> for P<f32> {
-    fn from(p: P<usize>) -> Self {
-        P(p.0 as f32, p.1 as f32)
-    }
-}
-
-impl P<f32> {
-    fn floor(&self) -> P<usize> {
-        P(self.0.floor() as usize, self.1.floor() as usize)
-    }
-}
-
-impl fmt::Display for P<f32> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "({:1.0},{:1.0})", self.0, self.1)
-    }
 }
 
 // ---------------- Simulation Parameters ----------------
@@ -100,10 +43,10 @@ struct Sim<const NX: usize, const NY: usize, C> where C: Fn((f32, f32)) -> (f32,
     p_h: Box<[[f32; NY]; NX]>,    // pressure for hot gas
     div_h: Box<[[f32; NY]; NX]>,  // divergence (hot gas)
 
-    phi: Box<[[f32; NY]; NX]>,   // level set (+pos in fuel region, -neg outside, 0 at boundary)
-    temp: Box<[[f32; NY]; NX]>,  // temperature field (hot gas domain)
-    rt: Box<[[f32; NY]; NX]>,    // reaction-time tracker (1 at fuel; decreases after crossing)
-    dns: Box<[[f32; NY]; NX]>,   // smoke density (simple)
+    phi: Box<[[f32; NY]; NX]>,       // level set (+pos in fuel region, -neg outside, 0 at boundary)
+    temp_gas: Box<[[f32; NY]; NX]>,  // temperature field (hot gas domain)
+    rt: Box<[[f32; NY]; NX]>,        // reaction-time tracker (1 at fuel; decreases after crossing)
+    dns: Box<[[f32; NY]; NX]>,       // smoke density (simple)
 
     tmp: Box<[[f32; NY]; NX]>, tmp2: Box<[[P<f32>; NY]; NX]>  // temporary intermediate fields for calculations
 }
@@ -124,7 +67,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
             div_h: Box::new([[0.0; NY]; NX]),
 
             phi: Box::new([[1.0; NY]; NX]),
-            temp: Box::new([[p.temp_air; NY]; NX]),
+            temp_gas: Box::new([[p.temp_air; NY]; NX]),
             rt: Box::new([[0.0; NY]; NX]),
             dns: Box::new([[0.0; NY]; NX]),
 
@@ -141,6 +84,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
                 if y < 10 {
                     self.u[x][y] = P(0.0, 1.5);
                     self.phi[x][y] = 5.0;
+                    self.temp_gas[x][y] = self.p.temp_air + 10.0;
                 } else {
                     self.phi[x][y] = -5.0;
                 }
@@ -152,7 +96,10 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         // (1) Update level set field //
         self.update_levelset();
 
-        // (2) Semi-Lagrangian advection of velocity fields //
+        // (2) Add Forces {Bouyancy, vorticity confinement} //
+        self.add_forces();
+
+        // (3) Semi-Lagrangian advection of velocity fields //
         self.semi_lagrangian_advect();
     }
 
@@ -160,6 +107,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
     /// Updates the level set using upwind one-sided differencing to estimate spatial derivatives
     fn update_levelset(&mut self) {
         let k_react = self.p.k_react;
+        self.tmp.copy_from_slice(&*self.phi);  // TODO
         for x in 1..NX-1 {
             for y in 1..NY-1 {
                 // (1.3) (unscaled) Central differencing for normed gradient (∇φ/|∇φ|) //
@@ -186,7 +134,46 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
                 self.tmp[x][y] = self.phi[x][y] - (wx*ddx + wy*ddy)*(self.p.dt/self.p.h);
             }
         }
-        std::mem::swap(&mut self.phi, &mut self.tmp);
+        std::mem::swap(&mut *self.phi, &mut *self.tmp);
+    }
+
+    fn add_forces(&mut self) {
+        let force = &mut *self.tmp2;
+        let (k_buoy, temp_air) = (self.p.k_buoy, self.p.temp_air);
+        for x in 0..NX {
+            for y in 0..NY {
+                // (2.1) Buoyancy force α(T - T_air)ŷ //
+                force[x][y] = P(0.0, k_buoy*(self.temp_gas[x][y] - temp_air));
+
+                // (2.2.1) (unscaled) Vorticity ω //
+                let P(_, dv_dx) = match x {
+                    0 =>             self.u[x+1][y],
+                    _ if x < NX-1 => self.u[x+1][y] - self.u[x-1][y],
+                    _ =>                            - self.u[x-1][y],
+                };
+                let P(du_dy, _) = match y {
+                    0 =>             self.u[x][y+1],
+                    _ if y < NY-1 => self.u[x][y+1] - self.u[x][y-1],
+                    _ =>                            - self.u[x][y-1],
+                };
+                self.tmp[x][y] = dv_dx - du_dy;
+            }
+        }
+        let (vconf, h, dt) = (self.p.vconf, self.p.h, self.p.dt);
+        for x in 1..NX-1 {
+            for y in 1..NY-1 {
+                // (2.2.2) (unscaled) Central differencing for normed gradient N = (∇|ω|/|∇|ω||) //
+                let gx = self.tmp[x+1][y].abs() - self.tmp[x-1][y].abs();  // gradient x-component
+                let gy = self.tmp[x][y+1].abs() - self.tmp[x][y-1].abs();  // gradient y-component
+                let norm = (gx*gx + gy*gy).sqrt().max(1e-8);  // gradient norm
+
+                // (2.2.3) (scaled) Force of vorticity confinement εh(N x ω) //
+                force[x][y] += P(-gy, gx)*self.tmp[x][y]*(vconf*h/norm);
+
+                // (2.3) Add force //
+                self.u[x][y] += force[x][y]*dt;
+            }
+        }
     }
 
     // ------------- (2) Semi-Lagrangian advection of velocity fields -------------
@@ -200,18 +187,14 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
 
                 // backtrace half-step to midpoint //
                 let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
-
-                // midpoint velocity //
-                let u0 = self.sample_bilin(u, (x0, y0));
+                let u0 = self.sample_bilin(u, (x0, y0));  // midpoint velocity
 
                 // backtrace full step //
                 let P(x0, y0) = P(x1, y1) - u0*(dt/h);
-                
-                // final velocity //
-                self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));
+                self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));  // final velocity
             }
         }
-        std::mem::swap(&mut self.u, &mut self.tmp2);
+        std::mem::swap(&mut *self.u, &mut *self.tmp2);
     }
 
     // ----------------- Utility Functions -----------------
@@ -234,7 +217,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
             Field::Ph => ("Hot Gas Pressure", &*self.p_h),
             Field::Divh => ("Divergence of Hot Gas Pressure", &*self.div_h),
             Field::Phi => ("Level Set", &*self.phi),
-            Field::Temp => ("Temperature", &*self.temp),
+            Field::Temp => ("Temperature", &*self.temp_gas),
             Field::Rt => ("Reaction Parameter", &*self.rt),
             Field::Dns => ("Smoke Density", &*self.dns)
         };
@@ -273,7 +256,7 @@ fn main() {
     sim.print_field(Field::Phi);
     sim.print_field(Field::U);
     
-    let steps = 300;
+    let steps = 100;
     println!("Simulating {steps} steps...");
     for _ in (0..steps).progress() {
         sim.step();

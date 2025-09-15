@@ -2,7 +2,7 @@
 Incompressible Navier-Stokes
 $$\pdv{\mathbf{u}}{t} = -(\mathbf{u}\cdot\nabla)\mathbf{u} - \frac{1}{\rho}\nabla p + \nu\nabla^2\mathbf{u} + \mathbf{f}$$
 ## Stable Fluids
-## 1. **Thin flame** tracked by **level set** $\phi$
+## 1. **Thin flame** tracked by **level set** $\phi$[^1]
 1. Implicit surface where ($\phi=0$) defines the interface between
 	- **Fuel** ($\phi>0$) blue-core reaction zone
 	- **Hot Gas** ($\phi<0$)
@@ -13,12 +13,17 @@ $$\mathbf{n} = \nabla\phi/|\nabla\phi|$$
 4. Time derivative of level set (upwind differencing for $\nabla\phi$)
 $$\phi_t = -(\mathbf{u}_f + S\mathbf{n})\cdot\nabla\phi$$
 - evolve **fuel** and **hot gas** velocity fields separately
-### 2. **Add Force** (before advection)
-#### Buoyancy
-- $f_{buoy} = \alpha(T - T_{air})\hat{z}$
-#### Vorticity Confinement
-- $f_{conf} = \varepsilon h(N\times \omega)$ 
-### 3. **Advection**
+### 2. **Add Force** (before advection)[^2]
+ 1. Buoyancy
+$$f_{buoy} = \alpha(T - T_{air})\hat{z}$$
+2. Vorticity Confinement
+	1. Vorticity vector
+$$\mathbf{\omega} = \nabla\times\mathbf{u}$$
+	2. Normalized vorticity location vector (central differencing)
+$$\mathbf{n} = \nabla|\mathbf{\omega}|/|\nabla|\mathbf{\omega}||$$
+	 3. Force of vorticity confinement
+ $$f_{conf} = \varepsilon h(\mathbf{N}\times\mathbf{\omega})$$
+### 3. **Advection**[^3]
 - for incompressible flow (Stam's 4-step loop)
 - Stable Semi-Lagrangian
 	- `semi_lagrangian_advect`
@@ -67,11 +72,26 @@ $T_t = -(\mathbf{u}\cdot\nabla)T - c_T\Big(\frac{T - T_{air}}{T_{max} - T_{air}}
 	- (applied during semi-Lagrangian sampling of hot-gas field)
 	- pressure jump conditions not enforced in the linear system
 
-- [ ] generalize to 3D
-- [ ] generic Field type
+
 
 
 # Miscellaneous Notes
+## Discretization
+### Staggered Field Grids[^2]
+#### Velocity Field
+Defined at faces/edges of grid cells
+$$\mathbf{u} = (u, v)$$
+$$u_{i+1/2,\; j}\quad i\in\{0,\cdots, N_x\}\quad j\in\{1,\cdots,N_y\}$$
+$$v_{i,\; j+1/2}\quad i\in\{1,\cdots, N_x\}\quad j\in\{0,\cdots,N_y\}$$
+##### Cell-Centered Velocities
+$$\bar{u}_{i,\; j} = (u_{i+1/2,\; j} + u_{i-1/2,\; j})/2 \quad \bar{v}_{i,\; j} = (v_{,\; j+1/2} + v_{i,\; j-1/2})/2$$
+##### Vorticity
+$$|\omega| = \omega^3_{i,\; j} = (\bar{v}_{i+1,\; j} - \bar{v}_{i-1,\; j} - \bar{u}_{i,\; j+1} + \bar{u}_{i,\; j-1})/2h$$
+#### All Other Fields
+Defined at center of grid cells
+$$F_{i,\; j}\quad i\in\{1,\cdots, N_x\}\quad j\in\{1,\cdots,N_y\}$$
+
+
 ## Advection Equation
 Advection for a conserved quantity described by a scalar field $\psi(t, x, y, z)$ that flows with velocity $\mathbf{u}$
 $$\pdv{\psi}{t} + \nabla\cdot(\psi\mathbf{u}) = 0$$
@@ -81,3 +101,7 @@ For a generic scalar field $S$ that flows with velocity $\mathbf{u}$
 $$\pdv{S}{t} = -(\mathbf{u}\cdot\nabla)S + k_S\nabla^2S - a_SS + source$$
 - $k_S$  :  diffusion constant
 - $a_S$  :  dissipation rate
+
+[^1]: Nguyen, Duc & Fedkiw, Ronald & Jensen, Henrik. (2002). [Physically Based Modeling and Animation of Fire](http://dx.doi.org/10.1145/566570.566643). ACM Transactions on Graphics. 21. 10.1145/566570.566643. 
+[^2]: Fedkiw, Ronald & Stam, Jos & Jensen, Henrik. (2001). [Visual Simulation of Smoke](http://dx.doi.org/10.1145/383259.383260). ACM SIGGRAPH2001, 2001.. 10.1145/383259.383260. 
+[^3]: Stam, Jos. (2001). [Stable Fluids](http://dx.doi.org/10.1145/311535.311548). ACM SIGGRAPH 99. 1999. 10.1145/311535.311548. 

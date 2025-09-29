@@ -3,6 +3,8 @@ use indicatif::ProgressIterator;
 
 mod grid;
 
+const MIN_NORM: f32 = 1e-8;
+
 // ---------------- Utility Functions ----------------
 fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((f32, f32)) -> (f32, f32)> {
     let maxx = (NX as f32) - 1.001;
@@ -113,7 +115,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
                 // (1.3) (unscaled) Central differencing for normed gradient (∇φ/|∇φ|) //
                 let gx = self.phi[x+1][y] - self.phi[x-1][y];  // gradient x-component
                 let gy = self.phi[x][y+1] - self.phi[x][y-1];  // gradient y-component
-                let norm = (gx*gx + gy*gy).sqrt().max(1e-8);  // gradient norm
+                let norm = (gx*gx + gy*gy).sqrt().max(MIN_NORM);  // gradient norm
                 
                 // (1.2) Velocity of implicit surface (where φ==0) //
                 let P(wx, wy) = self.u[x][y] + P(gx, gy)*(k_react/norm);
@@ -165,7 +167,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
                 // (2.2.2) (unscaled) Central differencing for normed gradient N = (∇|ω|/|∇|ω||) //
                 let gx = self.tmp[x+1][y].abs() - self.tmp[x-1][y].abs();  // gradient x-component
                 let gy = self.tmp[x][y+1].abs() - self.tmp[x][y-1].abs();  // gradient y-component
-                let norm = (gx*gx + gy*gy).sqrt().max(1e-8);  // gradient norm
+                let norm = (gx*gx + gy*gy).sqrt().max(MIN_NORM);  // gradient norm
 
                 // (2.2.3) (scaled) Force of vorticity confinement εh(N x ω) //
                 force[x][y] += P(-gy, gx)*self.tmp[x][y]*(vconf*h/norm);
@@ -179,22 +181,60 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
     // ------------- (2) Semi-Lagrangian advection of velocity fields -------------
     /// Runge-Kutta 2-stage backtrace, bilinear velocity sampling, clamped at boundaries
     fn semi_lagrangian_advect(&mut self) {
-        let u = &self.u;
+        let (u, phi) = (&*self.u, &*self.phi);
         let (dt, h) = (self.p.dt, self.p.h);
         for x in 0..NX {
             for y in 0..NY {
                 let P(x1, y1) = P(x as f32, y as f32);
 
-                // backtrace half-step to midpoint //
-                let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
-                let u0 = self.sample_bilin(u, (x0, y0));  // midpoint velocity
+                // Proceed accordingly if whether implicit surface is crossed //
+                if self.sample_bilin(phi, (x1, y1)) > 0.0 {  // already in fuel region initially
+                    // backtrace half-step to midpoint //
+                    let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
+                    let u0 = self.sample_bilin(u, (x0, y0));  // midpoint velocity
 
-                // backtrace full step //
-                let P(x0, y0) = P(x1, y1) - u0*(dt/h);
-                self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));  // final velocity
+                    // backtrace full step //
+                    let P(x0, y0) = P(x1, y1) - u0*(dt/h);
+                    self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));  // final velocity
+
+                } else {
+                    // backtrace half-step to midpoint //
+                    let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
+                    let phi_0 = self.sample_bilin(phi, (x0, y0));
+                    let u0 = if phi_0 > 0.0 {  // if boundary crossed...
+                        self.sample_ghost_velocity(P(x0, y0))  // ...sample ghost velocity
+                    } else {
+                        self.sample_bilin(u, (x0, y0))
+                    };  // midpoint velocity
+
+                    // backtrace full step //
+                    let P(x0, y0) = P(x1, y1) - u0*(dt/h);
+                    let phi_0 = self.sample_bilin(phi, (x0, y0));
+                    self.tmp2[x][y] = if phi_0 > 0.0 {  // if boundary crossed...
+                        self.sample_ghost_velocity(P(x0, y0))  // ...sample ghost velocity
+                    } else {
+                        self.sample_bilin(u, (x0, y0))
+                    };  // final velocity
+                }
             }
         }
         std::mem::swap(&mut *self.u, &mut *self.tmp2);
+    }
+
+    fn sample_ghost_velocity(&self, p: P<f32>) -> P<f32> {
+        let P(x, y) = p;
+        let (phi, u) = (&*self.phi, &*self.u);
+        let (d_h, d_f, s) = (self.p.d_hgas, self.p.d_fuel, self.p.k_react);
+
+            // (unscaled) Central differencing for normed gradient at non-integer coordinate
+            let nx = self.sample_bilin(phi, (x+1.0, y)) - self.sample_bilin(phi, (x-1.0, y));
+            let ny = self.sample_bilin(phi, (x, y+1.0)) - self.sample_bilin(phi, (x, y-1.0));
+            let norm = (nx*nx + ny*ny).sqrt().max(MIN_NORM);
+            let n = P(nx, ny)*(1.0/norm);  // implicit surface unit normal vector
+            
+            let u_ghost = self.sample_bilin(u, (x, y)) + n*(d_f/d_h - 1.0)*s;
+            
+            u_ghost
     }
 
     // ----------------- Utility Functions -----------------

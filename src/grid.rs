@@ -66,6 +66,13 @@ impl P<f32> {
     }
 }
 
+impl<T> Mul for P<T> where T: Add<Output = T> + Mul<Output = T> + Copy {
+	type Output = T;
+	fn mul(self, rhs: Self) -> T {
+		self.0*rhs.0 + self.1*rhs.1
+	}
+}
+
 impl fmt::Display for P<f32> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let p = f.precision().unwrap_or(2);

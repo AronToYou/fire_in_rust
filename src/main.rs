@@ -5,6 +5,7 @@ mod grid;
 
 const MIN_NORM: f32 = 1e-8;
 
+
 // ---------------- Utility Functions ----------------
 fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((f32, f32)) -> (f32, f32)> {
     let maxx = (NX as f32) - 1.001;
@@ -12,6 +13,7 @@ fn new_sim<const NX: usize, const NY: usize>(p: Params) -> Sim<NX, NY, impl Fn((
     let clamp_xy = move |(x, y): (f32, f32)| (x.clamp(0.0, maxx), y.clamp(0.0, maxy));
     Sim::<NX, NY, _>::new(p, clamp_xy)
 }
+
 
 // ---------------- Simulation Parameters ----------------
 #[derive(Clone, Copy)]
@@ -35,6 +37,7 @@ struct Params {
     // scaling factor for rendering //
     render_scale: f32
 }
+
 
 // ---------------- Simulation State ----------------
 struct Sim<const NX: usize, const NY: usize, C> where C: Fn((f32, f32)) -> (f32, f32) {
@@ -94,6 +97,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         }
     }
 
+    /// Perform single full simulation step 
     fn step(&mut self) {
         // (1) Update level set field //
         self.update_levelset();
@@ -105,7 +109,8 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         self.semi_lagrangian_advect();
     }
 
-    // ----------------- (1) Thin-flame Level Set Propagation -----------------
+
+    // ----------------- A) Thin-flame Level Set Propagation -----------------
     /// Updates the level set using upwind one-sided differencing to estimate spatial derivatives
     fn update_levelset(&mut self) {
         let k_react = self.p.k_react;
@@ -139,15 +144,18 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         std::mem::swap(&mut *self.phi, &mut *self.tmp);
     }
 
+
+    // ------------- B) 1. Changes in velocity due to acceleration by force -------------
+    /// Addition of Bouyancy and Voriticity Confinement effects to velocity field
     fn add_forces(&mut self) {
         let force = &mut *self.tmp2;
         let (k_buoy, temp_air) = (self.p.k_buoy, self.p.temp_air);
         for x in 0..NX {
             for y in 0..NY {
-                // (2.1) Buoyancy force α(T - T_air)ŷ //
+                // B) 1.1 Buoyancy force α(T - T_air)ŷ //
                 force[x][y] = P(0.0, k_buoy*(self.temp_gas[x][y] - temp_air));
 
-                // (2.2.1) (unscaled) Vorticity ω //
+                // B) 1.2.1 (unscaled) Vorticity ω //
                 let P(_, dv_dx) = match x {
                     0 =>             self.u[x+1][y],
                     _ if x < NX-1 => self.u[x+1][y] - self.u[x-1][y],
@@ -164,21 +172,22 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         let (vconf, h, dt) = (self.p.vconf, self.p.h, self.p.dt);
         for x in 1..NX-1 {
             for y in 1..NY-1 {
-                // (2.2.2) (unscaled) Central differencing for normed gradient N = (∇|ω|/|∇|ω||) //
+                // B) 1.2.2 (unscaled) Central differencing for normed gradient N = (∇|ω|/|∇|ω||) //
                 let gx = self.tmp[x+1][y].abs() - self.tmp[x-1][y].abs();  // gradient x-component
                 let gy = self.tmp[x][y+1].abs() - self.tmp[x][y-1].abs();  // gradient y-component
                 let norm = (gx*gx + gy*gy).sqrt().max(MIN_NORM);  // gradient norm
 
-                // (2.2.3) (scaled) Force of vorticity confinement εh(N x ω) //
+                // B) 1.2.3 (scaled) Force of vorticity confinement εh(N x ω) //
                 force[x][y] += P(-gy, gx)*self.tmp[x][y]*(vconf*h/norm);
 
-                // (2.3) Add force //
+                // B) 1.3 Add force //
                 self.u[x][y] += force[x][y]*dt;
             }
         }
     }
 
-    // ------------- (2) Semi-Lagrangian advection of velocity fields -------------
+
+    // ------------- B) 2. Semi-Lagrangian advection of velocity fields -------------
     /// Runge-Kutta 2-stage backtrace, bilinear velocity sampling, clamped at boundaries
     fn semi_lagrangian_advect(&mut self) {
         let (u, phi) = (&*self.u, &*self.phi);
@@ -189,38 +198,59 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
 
                 // Proceed accordingly if whether implicit surface is crossed //
                 if self.sample_bilin(phi, (x1, y1)) > 0.0 {  // already in fuel region initially
-                    // backtrace half-step to midpoint //
+                    // B) 2.1 backtrace half-step to midpoint //
                     let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
-                    let u0 = self.sample_bilin(u, (x0, y0));  // midpoint velocity
+                    let u0 = self.sample_bilin(u, (x0, y0));  // B) 2.2 midpoint velocity
 
-                    // backtrace full step //
+                    // B) 2.3 backtrace full step //
                     let P(x0, y0) = P(x1, y1) - u0*(dt/h);
-                    self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));  // final velocity
+                    self.tmp2[x][y] = self.sample_bilin(u, (x0, y0));  // B) 2.4 final velocity
 
                 } else {
-                    // backtrace half-step to midpoint //
+                    // B) 2.1 backtrace half-step to midpoint //
                     let P(x0, y0) = P(x1, y1) - u[x][y]*(0.5*dt/h);
                     let phi_0 = self.sample_bilin(phi, (x0, y0));
                     let u0 = if phi_0 > 0.0 {  // if boundary crossed...
                         self.sample_ghost_velocity(P(x0, y0))  // ...sample ghost velocity
                     } else {
                         self.sample_bilin(u, (x0, y0))
-                    };  // midpoint velocity
+                    };  // B) 2.2 midpoint velocity
 
-                    // backtrace full step //
+                    // B) 2.3 backtrace full step //
                     let P(x0, y0) = P(x1, y1) - u0*(dt/h);
                     let phi_0 = self.sample_bilin(phi, (x0, y0));
                     self.tmp2[x][y] = if phi_0 > 0.0 {  // if boundary crossed...
                         self.sample_ghost_velocity(P(x0, y0))  // ...sample ghost velocity
                     } else {
                         self.sample_bilin(u, (x0, y0))
-                    };  // final velocity
+                    };  // B) 2.4 final velocity
                 }
             }
         }
         std::mem::swap(&mut *self.u, &mut *self.tmp2);
     }
 
+
+    // ------------- B) 2. Semi-Lagrangian advection of velocity fields -------------
+    /// Runge-Kutta 2-stage backtrace, bilinear velocity sampling, clamped at boundaries
+    fn diffuse_velocity(&mut self) {
+        let (visc, dt, h) = (self.p.visc, self.p.dt, self.p.h);
+        let alpha = h*h/(visc*dt);
+        let r_beta = 1.0/(4.0 + alpha);
+
+        for _ in 0..20 {  // Gauss-Seidel iterations
+            for x in 1..NX-1 {
+                for y in 1..NY-1 {
+                    self.tmp2[x][y] = (self.u[x+1][y] + self.u[x-1][y] + self.u[x][y+1] + self.u[x][y-1] + self.u[x][y]*alpha)*r_beta;
+                }
+            }
+            std::mem::swap(&mut *self.u, &mut *self.tmp2);
+        }
+    }
+    
+    
+    // ----------------- Utility Functions -----------------
+    /// Biinear sampling of hot gas 'ghost velocity' within the fuel region
     fn sample_ghost_velocity(&self, p: P<f32>) -> P<f32> {
         let P(x, y) = p;
         let (phi, u) = (&*self.phi, &*self.u);
@@ -237,7 +267,6 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
             u_ghost
     }
 
-    // ----------------- Utility Functions -----------------
     /// Bilinear sampling of scalar field, clamped at boundaries
     fn sample_bilin<T: Linterp>(&self, f: &[[T; NY]; NX], p: (f32, f32)) -> T {
         let (x, y) = (self.clamp_xy)(p);
@@ -271,6 +300,7 @@ impl<const NX: usize, const NY: usize, C> Sim<NX, NY, C> where C: Fn((f32, f32))
         }
     }
 }
+
 
 // ---------------- Main ----------------
 fn main() {
